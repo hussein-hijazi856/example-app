@@ -1,0 +1,1020 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "create-new-environment",
+
+    "Parameters": {
+        "env": {
+            "Type": "String",
+            "Default": "testenv",
+            "Description": "The name of the environment (testing, production, prod2 etc...) this will affect the naming of other resources",
+            "AllowedPattern" : "^[0-9a-zA-Z]{2,9}$"
+        },
+        "cidrBlock": {
+            "Type": "String",
+            "Default": "16.0.0.0",
+            "Description": "Skip if environment type is testing. The cidr block of the created subnet, the suffix will be /16 so choose a compatible CIDR,\nex: 12.45.0.0 becomes 12.45.0.0/16 which is correct. 12.45.1.0 becomes 12.45.1.0/16 which is an incorrect subnet.",
+            "AllowedPattern" : "^([0-9]{1,3}\\.){3}[0-9]{1,3}$"
+        },
+        "ecsTaskCount": {
+          "Type": "String",
+          "Default": "1",
+          "AllowedPattern" : "^[0-9]*$",
+          "Description": "Description: The number of ECS tasks. Set it to blank when updating the stack(make it empty)"
+        },
+        "sslACMCertificateArn": {
+          "Type": "String",
+          "Default": "",
+          "Description": "The arn of an existing ACM ssl certificate for the domain you chose"
+        },
+        "route53HostedZoneId": {
+          "Type": "String",
+          "Default": "",
+          "Description": "The id of the hosted zone where the Route53 dns record resides"
+        },
+        "fullDomainName": {
+          "Type": "String",
+          "Default": "",
+          "Description": "The full website domain name( prefix + base domain of the hosted zone ). ex: page1.example.com"
+        },
+        "dockerTag": {
+          "Type": "String",
+          "Default": "latest",
+          "Description": "The tag of the docker image"
+        },
+        "appHealthCheckPath": {
+          "Type": "String",
+          "Default": "/",
+          "Description": "The healthcheck http endpoint the LoadBalancer will ping to check the service health"
+        },
+        "applicationHealthCheckHttpCodeRange": {
+          "Type": "String",
+          "Default": "200-399",
+          "Description": "The healthcheck code/s that is/are considered healthy, can be a single number ex: 200 or a range ex: 200-399"
+        },
+        "applicationInternalPort": {
+          "Type": "String",
+          "Default": "80",
+          "AllowedPattern" : "^[0-9]*$",
+          "Description": "The internal port the app listens to"
+        },
+        "bastionSshkeyPair": {
+          "Type": "String",
+          "Default": "temp-key-pair",
+          "Description": "The key pair used to access the instance"
+        },
+        "sqsQueueArn": {
+          "Type": "String",
+          "Default": "arn:aws:sqs:eu-west-1:123456789:queue1",
+          "Description": "The ARN of the sqs queue monitored for it's visible messages"
+        }
+    },
+    "Conditions": {
+      "IsEcsTaskCountBlank": { "Fn::Equals": [{ "Ref": "ecsTaskCount" }, ""] }
+    },
+    "Metadata" : {
+        "AWS::CloudFormation::Interface" : {
+          "ParameterLabels": {
+              "env" : { "default" : "Environment name" },
+              "cidrBlock" : { "default" : "Ipv4 CIDR block" },
+              "ecsTaskCount" : { "default" : "ECS task count" },
+              "sslACMCertificateArn" : { "default" : "SSL ACM Certificate Arn" },
+              "route53HostedZoneId" : { "default" : "Route53 hosted zone id" },
+              "fullDomainName" : { "default" : "Full domain name" },
+              "dockerTag" : { "default" : "Docker Tag" },
+              "appHealthCheckPath" : { "default" : "Application Health Check Path" },
+              "applicationHealthCheckHttpCodeRange" : { "default" : "Healthy http response code range" },
+              "applicationInternalPort" : { "default" : "Application Internal Port" },
+              "bastionSshkeyPair" : { "default" : "Bastion SSH Key Pair" },
+              "sqsQueueArn" : { "default" : "Sqs Queue Arn" }
+          }
+        }
+    },
+    "Mappings" : {
+        "Variables" : {
+            "BastionAMI": { "value": "ami-08ca3fed11864d6bb" }
+        }
+    },
+
+    "Outputs" : {
+      "env" : {
+        "Description" : "The environment name",
+        "Value" : {"Ref": "env"}
+      },
+      "ecsClusterName" : {
+        "Description" : "The name of the main ecs cluster",
+        "Value" : {"Ref": "ApplicationECSCluster"}
+      },
+      "ecsServiceName" : {
+        "Description" : "The name of the main ecs service",
+        "Value" : {"Fn::GetAtt": [ "ApplicationECSService", "Name"]}
+      },
+      "ecrRepositoryUri" : {
+        "Description" : "The ecr repository uri",
+        "Value" : {"Fn::GetAtt": [ "ApplicationECRRepository", "RepositoryUri"]}
+      },
+      "url" : {
+        "Description" : "The api url",
+        "Value" : {"Ref": "DNSRecord"}
+      },
+      "bastionInstanceIp" : {
+        "Description" : "The public ip address of the bastion instance. Can be used to ssh into it.",
+        "Value" : { "Fn::GetAtt" : [ "BastionInstance", "PublicIp" ]}
+      }
+    },
+
+    "Resources": {
+
+        "Vpc": {
+          "Type": "AWS::EC2::VPC",
+          "Properties": {
+            "CidrBlock": { "Fn::Join" : [ "/", [ { "Ref": "cidrBlock" }, "16" ] ] },
+            "EnableDnsHostnames": true,
+            "EnableDnsSupport": true,
+            "InstanceTenancy": "default",
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "vpc" ] ] }
+            } ]
+          }
+        },
+
+        "VpcCidrBlock": {
+          "Type": "AWS::EC2::VPCCidrBlock",
+          "Properties": {
+            "AmazonProvidedIpv6CidrBlock": true,
+            "VpcId": { "Ref" : "Vpc" }
+          }
+        },
+
+        "ISVPCReady":{
+          "Type": "AWS::CloudFormation::WaitConditionHandle",
+          "Metadata":{
+            "SecondaryCIDReady": { "Ref":"VpcCidrBlock" },
+            "VPCIgwAssociationReady": { "Ref":"VpcGatewayAssociation" }
+          }
+        },
+
+        "PublicSubnetA": {
+          "Type" : "AWS::EC2::Subnet",
+          "DependsOn" : "ISVPCReady",
+          "Properties" : {
+            "AvailabilityZone" : "eu-west-1a",
+            "CidrBlock" : { "Fn::Select" : [ 0, { "Fn::Cidr" : [ { "Fn::GetAtt" : [ "Vpc", "CidrBlock" ]} , 6, 12 ]}]},
+            "Ipv6CidrBlock" : { "Fn::Select" : [ 0, { "Fn::Cidr" : [{ "Fn::Select" : [ 0, { "Fn::GetAtt" : [ "Vpc", "Ipv6CidrBlocks" ]}]}, 3, 64 ]}]},
+            "MapPublicIpOnLaunch" : true,
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "public-subnet-a" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PublicSubnetB": {
+          "Type" : "AWS::EC2::Subnet",
+          "DependsOn" : "ISVPCReady",
+          "Properties" : {
+            "AvailabilityZone" : "eu-west-1b",
+            "CidrBlock" : { "Fn::Select" : [ 1, { "Fn::Cidr" : [ { "Fn::GetAtt" : [ "Vpc", "CidrBlock" ]} , 6, 12 ]}]},
+            "Ipv6CidrBlock" : { "Fn::Select" : [ 1, { "Fn::Cidr" : [{ "Fn::Select" : [ 0, { "Fn::GetAtt" : [ "Vpc", "Ipv6CidrBlocks" ]}]}, 3, 64 ]}]},
+            "MapPublicIpOnLaunch" : true,
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "public-subnet-b" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PublicSubnetC": {
+          "Type" : "AWS::EC2::Subnet",
+          "DependsOn" : "ISVPCReady",
+          "Properties" : {
+            "AvailabilityZone" : "eu-west-1c",
+            "CidrBlock" : { "Fn::Select" : [ 2, { "Fn::Cidr" : [ { "Fn::GetAtt" : [ "Vpc", "CidrBlock" ]} , 6, 12 ]}]},
+            "Ipv6CidrBlock" : { "Fn::Select" : [ 2, { "Fn::Cidr" : [{ "Fn::Select" : [ 0, { "Fn::GetAtt" : [ "Vpc", "Ipv6CidrBlocks" ]}]}, 3, 64 ]}]},
+            "MapPublicIpOnLaunch" : true,
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "public-subnet-c" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PrivateSubnetA": {
+          "Type" : "AWS::EC2::Subnet",
+          "Properties" : {
+            "AvailabilityZone" : "eu-west-1a",
+            "CidrBlock" : { "Fn::Select" : [ 3, { "Fn::Cidr" : [ { "Fn::GetAtt" : [ "Vpc", "CidrBlock" ]} , 6, 12 ]}]},
+            "MapPublicIpOnLaunch" : false,
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "private-subnet-a" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PrivateSubnetB": {
+          "Type" : "AWS::EC2::Subnet",
+          "Properties" : {
+            "AvailabilityZone" : "eu-west-1b",
+            "CidrBlock" : { "Fn::Select" : [ 4, { "Fn::Cidr" : [ { "Fn::GetAtt" : [ "Vpc", "CidrBlock" ]} , 6, 12 ]}]},
+            "MapPublicIpOnLaunch" : false,
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "private-subnet-b" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PrivateSubnetC": {
+          "Type" : "AWS::EC2::Subnet",
+          "Properties" : {
+            "AvailabilityZone" : "eu-west-1c",
+            "CidrBlock" : { "Fn::Select" : [ 5, { "Fn::Cidr" : [ { "Fn::GetAtt" : [ "Vpc", "CidrBlock" ]} , 6, 12 ]}]},
+            "MapPublicIpOnLaunch" : false,
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "private-subnet-c" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "InternetGateway": {
+          "Type" : "AWS::EC2::InternetGateway",
+          "Properties" : {
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "internet-gateway" ] ] }
+            } ]
+          }
+        },
+        "VpcGatewayAssociation": {
+          "Type" : "AWS::EC2::VPCGatewayAttachment",
+          "Properties" : {
+            "InternetGatewayId" : { "Ref" : "InternetGateway" },
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "ElasticIp": {
+          "Type" : "AWS::EC2::EIP",
+          "Properties" : {
+            "Domain" : "vpc",
+            "Tags" : [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "nat-ip" ] ] }
+            } ]
+          }
+        },
+        "NatGateway": {
+          "Type" : "AWS::EC2::NatGateway",
+          "Properties" : {
+            "AllocationId" : { "Fn::GetAtt": [ "ElasticIp",  "AllocationId" ] },
+            "SubnetId" : { "Ref" : "PublicSubnetA" },
+            "Tags" : [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "nat-1" ] ] }
+            } ]
+          }
+        },
+        "PublicRouteTable": {
+          "Type" : "AWS::EC2::RouteTable",
+          "Properties" : {
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "public-table" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PrivateRouteTable": {
+          "Type" : "AWS::EC2::RouteTable",
+          "Properties" : {
+            "Tags": [ {
+              "Key" : "Name",
+              "Value" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "private-table" ] ] }
+            } ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "PublicRoute": {
+          "Type" : "AWS::EC2::Route",
+          "Properties" : {
+            "DestinationCidrBlock" : "0.0.0.0/0",
+            "GatewayId" : { "Ref" : "InternetGateway" },
+            "RouteTableId": { "Ref" : "PublicRouteTable" }
+          }
+        },
+        "PublicRouteV6": {
+          "Type" : "AWS::EC2::Route",
+          "Properties" : {
+            "DestinationIpv6CidrBlock" : "::/0",
+            "GatewayId" : { "Ref" : "InternetGateway" },
+            "RouteTableId": { "Ref" : "PublicRouteTable" }
+          }
+        },
+        "SubnetRouteTableAssociationA": {
+          "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties" : {
+            "RouteTableId" : { "Ref" : "PublicRouteTable" },
+            "SubnetId" : { "Ref" : "PublicSubnetA" }
+          }
+        },
+        "SubnetRouteTableAssociationB": {
+          "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties" : {
+            "RouteTableId" : { "Ref" : "PublicRouteTable" },
+            "SubnetId" : { "Ref" : "PublicSubnetB" }
+          }
+        },
+        "SubnetRouteTableAssociationC": {
+          "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties" : {
+            "RouteTableId" : { "Ref" : "PublicRouteTable" },
+            "SubnetId" : { "Ref" : "PublicSubnetC" }
+          }
+        },
+        "NatRoute": {
+          "Type" : "AWS::EC2::Route",
+          "Properties" : {
+            "DestinationCidrBlock" : "0.0.0.0/0",
+            "NatGatewayId" : { "Ref" : "NatGateway" },
+            "RouteTableId": { "Ref" : "PrivateRouteTable" }
+          }
+        },
+        "PrivateSubnetRouteTableAssociationA": {
+          "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties" : {
+            "RouteTableId" : { "Ref" : "PrivateRouteTable" },
+            "SubnetId" : { "Ref" : "PrivateSubnetA" }
+          }
+        },
+        "PrivateSubnetRouteTableAssociationB": {
+          "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties" : {
+            "RouteTableId" : { "Ref" : "PrivateRouteTable" },
+            "SubnetId" : { "Ref" : "PrivateSubnetB" }
+          }
+        },
+        "PrivateSubnetRouteTableAssociationC": {
+          "Type" : "AWS::EC2::SubnetRouteTableAssociation",
+          "Properties" : {
+            "RouteTableId" : { "Ref" : "PrivateRouteTable" },
+            "SubnetId" : { "Ref" : "PrivateSubnetC" }
+          }
+        },
+
+        "BastionInstanceSg": {
+          "Type" : "AWS::EC2::SecurityGroup",
+          "Properties" : {
+            "GroupDescription" : "Control access to bastion instance",
+            "GroupName" : { "Fn::Join": [ " ", [ { "Ref": "env" }, "Bastion Instance" ] ] },
+            "SecurityGroupEgress" : [ 
+              {
+                "CidrIp" : "0.0.0.0/0",
+                "Description" : "Allow all outgoing traffic",
+                "FromPort" : -1,
+                "IpProtocol" : -1,
+                "ToPort" : -1
+              }
+            ],
+            "SecurityGroupIngress" : [
+              {
+                "CidrIp" : "0.0.0.0/0",
+                "Description" : "allow anyone to ssh into bastion",
+                "FromPort" : 22,
+                "IpProtocol" : "tcp",
+                "ToPort" : 22
+              },
+              {
+                "CidrIpv6" : "::/0",
+                "Description" : "allow anyone to ssh into bastion",
+                "FromPort" : 22,
+                "IpProtocol" : "tcp",
+                "ToPort" : 22
+              }
+            ],
+            "Tags" : [ ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+
+        "ApplicationSg": {
+          "Type" : "AWS::EC2::SecurityGroup",
+          "Properties" : {
+            "GroupDescription" : "Control access to the application",
+            "GroupName" : { "Fn::Join": [ " ", [ { "Ref": "env" }, "Application" ] ] },
+            "SecurityGroupEgress" : [ 
+              {
+                "CidrIp" : "0.0.0.0/0",
+                "Description" : "Allow all outgoing traffic",
+                "FromPort" : -1,
+                "IpProtocol" : -1,
+                "ToPort" : -1
+              }
+            ],
+            "SecurityGroupIngress" : [
+              {
+                "SourceSecurityGroupId" : { "Ref" : "BastionInstanceSg" },
+                "Description" : "allow bastion to ssh into the application instances",
+                "FromPort" : 22,
+                "IpProtocol" : "tcp",
+                "ToPort" : 22
+              },
+              {
+                "SourceSecurityGroupId" : { "Ref" : "BastionInstanceSg" },
+                "Description" : "allow bastion to call the application through api",
+                "FromPort" : { "Ref": "applicationInternalPort" },
+                "IpProtocol" : "tcp",
+                "ToPort" : { "Ref": "applicationInternalPort" }
+              },
+              {
+                "SourceSecurityGroupId" : { "Ref" : "ApplicationLoadBalancerSg" },
+                "Description" : "allow load balancer to call the application through api",
+                "FromPort" : { "Ref": "applicationInternalPort" },
+                "IpProtocol" : "tcp",
+                "ToPort" : { "Ref": "applicationInternalPort" }
+              }
+            ],
+            "Tags" : [ ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "ApplicationLoadBalancerSg": {
+          "Type" : "AWS::EC2::SecurityGroup",
+          "Properties" : {
+            "GroupDescription" : "Control access to the application",
+            "GroupName" : { "Fn::Join": [ " ", [ { "Ref": "env" }, "Application LB" ] ] },
+            "SecurityGroupEgress" : [ 
+              {
+                "CidrIp" : "0.0.0.0/0",
+                "Description" : "Allow all outgoing traffic",
+                "FromPort" : -1,
+                "IpProtocol" : -1,
+                "ToPort" : -1
+              }
+            ],
+            "SecurityGroupIngress" : [
+              {
+                "CidrIp" : "0.0.0.0/0",
+                "Description" : "allow anyone to call the loadbalancer",
+                "FromPort" : 80,
+                "IpProtocol" : "tcp",
+                "ToPort" : 80
+              },
+              {
+                "CidrIpv6" : "::/0",
+                "Description" : "allow anyone to call the loadbalancer",
+                "FromPort" : 80,
+                "IpProtocol" : "tcp",
+                "ToPort" : 80
+              },
+              {
+                "CidrIp" : "0.0.0.0/0",
+                "Description" : "allow anyone to call the loadbalancer",
+                "FromPort" : 443,
+                "IpProtocol" : "tcp",
+                "ToPort" : 443
+              },
+              {
+                "CidrIpv6" : "::/0",
+                "Description" : "allow anyone to call the loadbalancer",
+                "FromPort" : 443,
+                "IpProtocol" : "tcp",
+                "ToPort" : 443
+              }
+            ],
+            "Tags" : [ ],
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "BastionInstance":{
+          "Type" : "AWS::EC2::Instance",
+          "DependsOn" : "ISVPCReady",
+          "Properties" : {
+              "ImageId" : { "Fn::FindInMap" : [ "Variables", "BastionAMI", "value"]},
+              "IamInstanceProfile": { "Ref": "BastionInstanceProfile" },
+              "InstanceType" : "t2.micro",
+              "KeyName" : { "Ref": "bastionSshkeyPair" },
+              "NetworkInterfaces": [ {
+                "AssociatePublicIpAddress": true,
+                "DeviceIndex": "0",
+                "Ipv6AddressCount" : 1,
+                "GroupSet": [{ "Ref" : "BastionInstanceSg" }],
+                "SubnetId": { "Ref" : "PublicSubnetC" }
+              } ],
+              "Tags": [
+                {
+                  "Key" : "Name",
+                  "Value" : {
+                    "Fn::Join": [
+                      "-",
+                      [
+                        {
+                          "Ref": "env"
+                        },
+                        "bastion"
+                      ]
+                    ]
+                  }
+                }
+              ]
+            }
+        },
+        "ApplicationLoadBalancer": {
+          "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+          "Properties": {
+            "IpAddressType": "dualstack",
+            "LoadBalancerAttributes": [
+              {
+                "Key": "access_logs.s3.enabled",
+                "Value": "false"
+              },
+              {
+                "Key": "deletion_protection.enabled",
+                "Value": "false"
+              },
+              {
+                "Key": "idle_timeout.timeout_seconds",
+                "Value": "60"
+              },
+              {
+                "Key": "routing.http.drop_invalid_header_fields.enabled",
+                "Value": "false"
+              },
+              {
+                "Key": "routing.http2.enabled",
+                "Value": "true"
+              }
+            ],
+            "Name": {
+              "Fn::Join": [
+                "-",
+                [
+                  {
+                    "Ref": "env"
+                  },
+                  "load-balancer"
+                ]
+              ]
+            },
+            "Scheme": "internet-facing",
+            "SecurityGroups":[ 
+              { "Ref": "ApplicationLoadBalancerSg" }
+            ],
+            "Subnets": [
+              { "Ref": "PublicSubnetA" },
+              { "Ref": "PublicSubnetB" },
+              { "Ref": "PublicSubnetC" }
+            ],
+            "Tags": [],
+            "Type": "application"
+          }
+        },
+        "DNSRecord": {
+          "Type": "AWS::Route53::RecordSet",
+          "Properties": {
+            "HostedZoneId": {"Ref": "route53HostedZoneId"},
+            "Name": { "Fn::Join": [ "", [ { "Ref": "fullDomainName" }, "." ] ] },
+            "AliasTarget": {
+              "HostedZoneId": { "Fn::GetAtt": [ "ApplicationLoadBalancer", "CanonicalHostedZoneID" ]},
+              "DNSName": {
+                "Fn::Join": [
+                  ".",
+                  [
+                    "dualstack",
+                    {
+                      "Fn::GetAtt": [
+                        "ApplicationLoadBalancer",
+                        "DNSName"
+                      ]
+                    }
+                  ]
+                ]
+              }
+            },
+            "Type": "A"
+          }
+        },
+        "ApplicationTargetGroup": {
+          "Type" : "AWS::ElasticLoadBalancingV2::TargetGroup",
+          "Properties" : {
+            "HealthCheckEnabled" : true,
+            "HealthCheckIntervalSeconds" : 70,
+            "HealthCheckPath" : { "Ref": "appHealthCheckPath" },
+            "HealthCheckProtocol" : "HTTP",
+            "HealthCheckTimeoutSeconds" : 5,
+            "HealthyThresholdCount" : 2,
+            "IpAddressType" : "ipv4",
+            "Matcher" : { "HttpCode" : { "Ref": "applicationHealthCheckHttpCodeRange" } },
+            "Name" : {
+              "Fn::Join": [
+                "-",
+                [
+                  {
+                    "Ref": "env"
+                  },
+                  "main-tg"
+                ]
+              ]
+            },
+            "Port" : { "Ref": "applicationInternalPort" },
+            "Protocol" : "HTTP",
+            "ProtocolVersion" : "HTTP1",
+            "Tags" : [],
+            "TargetGroupAttributes" : 
+            [ 
+              {
+                "Key": "deregistration_delay.timeout_seconds",
+                "Value": "300"
+              },
+              {
+                "Key": "stickiness.enabled",
+                "Value": "false"
+              },
+              {
+                "Key": "load_balancing.algorithm.type",
+                "Value": "round_robin"
+              },
+              {
+                "Key": "slow_start.duration_seconds",
+                "Value": "0"
+              }
+            ],
+            "Targets" : [],
+            "TargetType" : "ip",
+            "UnhealthyThresholdCount" : 2,
+            "VpcId" : { "Ref": "Vpc" }
+          }
+        },
+        "ApplicationRedirectListener80": {
+          "Type": "AWS::ElasticLoadBalancingV2::Listener",
+          "Properties": {
+            "Certificates": [],
+            "DefaultActions": [
+              {
+                "Order" : 1,
+                "RedirectConfig" : {
+                  "Protocol": "HTTPS",
+                  "Port": 443,
+                  "Host": "#{host}",
+                  "Path": "/#{path}",
+                  "Query": "#{query}",
+                  "StatusCode": "HTTP_301"
+                },
+                "Type" : "redirect"
+              }
+            ],
+            "LoadBalancerArn": {
+              "Ref": "ApplicationLoadBalancer"
+            },
+            "Port": 80,
+            "Protocol": "HTTP"
+          }
+        },
+        "ApplicationListener443": {
+          "Type": "AWS::ElasticLoadBalancingV2::Listener",
+          "Properties": {
+            "Certificates": [{
+              "CertificateArn" : { "Ref": "sslACMCertificateArn" }
+            }],
+            "DefaultActions": [
+              {
+                "Order" : 1,
+                "ForwardConfig" : {
+                  "TargetGroups" : [ {
+                    "TargetGroupArn" : { "Ref": "ApplicationTargetGroup" },
+                    "Weight" : 100
+                  } ]
+                },
+                "Type" : "forward"
+              }
+            ],
+            "LoadBalancerArn": {
+              "Ref": "ApplicationLoadBalancer"
+            },
+            "Port": 443,
+            "Protocol": "HTTPS"
+          }
+        },
+
+        "ApplicationECSCluster": {
+          "Type" : "AWS::ECS::Cluster",
+          "Properties" : {
+              "CapacityProviders" : [ "FARGATE" ],
+              "ClusterName" : {
+                "Fn::Join": [
+                  "-",
+                  [
+                    {
+                      "Ref": "env"
+                    },
+                    "main-cluster"
+                  ]
+                ]
+              },
+              "ClusterSettings" : [ {
+                "Name" : "containerInsights",
+                "Value" : "enabled"
+              } ],
+              "Tags" : [ ]
+            }
+        },
+
+        "ApplicationECRRepository": {
+          "Type" : "AWS::ECR::Repository",
+          "Properties" : {
+              "ImageTagMutability" : "MUTABLE",
+              "RepositoryName" : {
+                "Fn::Join": [
+                  "-",
+                  [
+                    {
+                      "Ref": "env"
+                    },
+                    "main-repo"
+                  ]
+                ]
+              },
+              "Tags" : [ ]
+            }
+        },
+        "ApplicationECSLogGroup": {
+          "Type" : "AWS::Logs::LogGroup",
+          "Properties" : {
+              "LogGroupName" : {
+                "Fn::Join": [
+                  "",
+                  [
+                    "/ecs/",
+                    {
+                      "Ref": "env"
+                    },
+                    "main-app"
+                  ]
+                ]
+              }
+            }
+        },
+        "ApplicationExecutionRole": {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "AssumeRolePolicyDocument" : {
+                    "Version": "2008-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "ecs-tasks.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Description" : "A Role that allows basic ECS functions that includes image pulling from ecr and pushing logs to cloudwatch",
+                "ManagedPolicyArns" : [ "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" ],
+                "MaxSessionDuration" : 3600,
+                "Path" : "/ecs/",
+                "RoleName" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "BasicEcsRole" ] ] },
+                "Tags" : [
+                  { 
+                    "Key": "env",
+                    "Value": { "Ref": "env" }
+                  }
+                ]
+              }
+        },
+        "BastionExecutionRole": {
+            "Type" : "AWS::IAM::Role",
+            "Properties" : {
+                "AssumeRolePolicyDocument" : {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                      {
+                          "Effect": "Allow",
+                          "Principal": {
+                              "Service": "ec2.amazonaws.com"
+                          },
+                          "Action": "sts:AssumeRole"
+                      }
+                  ]
+                },
+                "Description" : "A Role that allows basic ECS functions that includes image pulling from ecr and pushing logs to cloudwatch",
+                "ManagedPolicyArns" : [ "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" ],
+                "MaxSessionDuration" : 3600,
+                "Path" : "/bastion/",
+                "RoleName" : { "Fn::Join": [ "-", [ { "Ref": "env" }, "BastionRole" ] ] },
+                "Tags" : [
+                  { 
+                    "Key": "env",
+                    "Value": { "Ref": "env" }
+                  }
+                ]
+              }
+        },
+        "BastionInstanceProfile": {
+          "Type": "AWS::IAM::InstanceProfile",
+          "Properties": {
+             "Path": "/",
+             "Roles": [ {
+                "Ref": "BastionExecutionRole"
+             } ]
+          }
+        },
+        "ApplicationECSTaskDefinition": {
+          "Type" : "AWS::ECS::TaskDefinition",
+          "Properties" : {
+              "ContainerDefinitions" : [ 
+                {
+                  "Cpu" : 0,
+                  "Environment" : [ ],
+                  "EnvironmentFiles" : [ ],
+                  "Essential" : true,
+                  "Image" : { "Fn::Join": [ ":", [ { "Fn::GetAtt": ["ApplicationECRRepository","RepositoryUri"] }, { "Ref": "dockerTag" } ] ] },
+                  "LogConfiguration": {
+                    "LogDriver": "awslogs",
+                    "Options": {
+                      "awslogs-group": { "Ref": "ApplicationECSLogGroup" },
+                      "awslogs-region": { "Ref" : "AWS::Region" },
+                      "awslogs-stream-prefix": "ecs"
+                    }
+                  },
+                  "MountPoints" : [ ],
+                  "Name" : "laravel-main",
+                  "PortMappings" : [
+                    {
+                      "HostPort": { "Ref": "applicationInternalPort" },
+                      "Protocol": "tcp",
+                      "ContainerPort": { "Ref": "applicationInternalPort" }
+                    }
+                  ],
+                  "VolumesFrom" : [ ]
+                }
+               ],
+              "Cpu" : "1024",
+              "ExecutionRoleArn" : {"Fn::GetAtt" : ["ApplicationExecutionRole", "Arn"] },
+              "Family" : {
+                "Fn::Join": [
+                  "",
+                  [
+                    {
+                      "Ref": "env"
+                    },
+                    "main-task-def"
+                  ]
+                ]
+              },
+              "Memory" : "2048",
+              "NetworkMode" : "awsvpc",
+              "PlacementConstraints" : [ ],
+              "RequiresCompatibilities" : [ "FARGATE" ],
+              "RuntimePlatform" : {
+                "OperatingSystemFamily": "LINUX"
+              },
+              "Tags" : [ ],
+              "TaskRoleArn" : {"Fn::GetAtt" : ["ApplicationExecutionRole", "Arn"] },
+              "Volumes" : [ ]
+            }
+        },
+        "ApplicationECSService": {
+          "Type" : "AWS::ECS::Service",
+          "DependsOn" : "ApplicationListener443",
+          "Properties" : {
+              "Cluster" : { "Ref": "ApplicationECSCluster" },
+              "DesiredCount": { "Fn::If": [ 
+                "IsEcsTaskCountBlank",
+                { "Ref": "AWS::NoValue" }, 
+                { "Ref": "ecsTaskCount" }
+              ] },
+              "DeploymentConfiguration" : {
+                "DeploymentCircuitBreaker" : {
+                  "Enable" : true,
+                  "Rollback" : true
+                },
+                "MaximumPercent" : 200,
+                "MinimumHealthyPercent" : 100
+              },
+              "DeploymentController" : {
+                "Type" : "ECS"
+              },
+              "HealthCheckGracePeriodSeconds" : 0,
+              "LaunchType" : "FARGATE",
+              "LoadBalancers" : [ {
+                "ContainerName" : "laravel-main",
+                "ContainerPort" : { "Ref": "applicationInternalPort" },
+                "TargetGroupArn" : { "Ref": "ApplicationTargetGroup" }
+              } ],
+              "NetworkConfiguration" : {
+                "AwsvpcConfiguration" : {
+                  "AssignPublicIp" : "DISABLED",
+                  "SecurityGroups" : [ { "Ref": "ApplicationSg" } ],
+                  "Subnets" : [ 
+                    { "Ref": "PrivateSubnetA" },
+                    { "Ref": "PrivateSubnetB" },
+                    { "Ref": "PrivateSubnetC" }
+                   ]
+                }
+              },
+              "PlatformVersion" : "1.4.0",
+              "SchedulingStrategy" : "REPLICA",
+              "ServiceName" : {
+                "Fn::Join": [
+                  "-",
+                  [
+                    {
+                      "Ref": "env"
+                    },
+                    "main-service"
+                  ]
+                ]
+              },
+              "Tags" : [ ],
+              "TaskDefinition" : { "Ref": "ApplicationECSTaskDefinition" }
+            }
+        },
+        "EcsTargetTrackingScalingCpuPolicy": {
+          "Type" : "AWS::ApplicationAutoScaling::ScalingPolicy",
+          "Properties" : {
+              "PolicyName" : { "Fn::Join": [ "-", [{"Ref": "env"}, "target-tracking-policy1" ] ]},
+              "PolicyType" : "TargetTrackingScaling",
+
+              "ScalingTargetId" : { "Ref": "ECSScalableTarget" },
+              "TargetTrackingScalingPolicyConfiguration" : {
+                "DisableScaleIn" : false,
+                "PredefinedMetricSpecification" : {
+                  "PredefinedMetricType" : "ECSServiceAverageCPUUtilization"
+                },
+                "ScaleInCooldown" : 300,
+                "ScaleOutCooldown" : 60,
+                "TargetValue" : 40.0
+              }              
+            }
+        },
+        "EcsStepScalingSqsPolicy": {
+          "Type" : "AWS::ApplicationAutoScaling::ScalingPolicy",
+          "Properties" : {
+              "PolicyName" : { "Fn::Join": [ "-", [{"Ref": "env"}, "step-scaling-policy1" ] ]},
+              "PolicyType" : "StepScaling",
+
+              "ScalingTargetId" : { "Ref": "ECSScalableTarget" },
+              "StepScalingPolicyConfiguration" : {
+                "AdjustmentType" : "ChangeInCapacity",
+                "Cooldown" : 300,
+                "MetricAggregationType" : "Average",
+                "StepAdjustments" : [ 
+                  {
+                    "MetricIntervalLowerBound" : 100,
+                    "MetricIntervalUpperBound" : 1000,
+                    "ScalingAdjustment" : 1
+                  },
+                  {
+                    "MetricIntervalLowerBound" : 1000,
+                    "MetricIntervalUpperBound" : 4000,
+                    "ScalingAdjustment" : 2
+                  },
+                  {
+                    "MetricIntervalLowerBound" : 4000,
+                    "ScalingAdjustment" : 3
+                  }
+                 ]
+              }                         
+            }
+        },
+
+
+
+        "CPUAlarmHigh":{
+          "Type":"AWS::CloudWatch::Alarm",
+          "Properties":{
+            "EvaluationPeriods":"5",
+            "Statistic":"Average",
+            "Threshold":"100",
+            "AlarmDescription":"Scale out if message count > 100",
+            "Period":"60",
+            "AlarmActions":[ { "Ref":"EcsStepScalingSqsPolicy" } ],
+            "Namespace":"AWS/SQS",
+            "Dimensions":[
+              {
+                "Name":"QueueArn",
+                "Value": { "Ref": "sqsQueueArn" }
+              }
+            ],
+            "ComparisonOperator":"GreaterThanThreshold",
+            "MetricName":"ApproximateNumberOfMessagesVisible"
+          }
+        },
+
+        "ECSScalableTarget" : {
+          "Type" : "AWS::ApplicationAutoScaling::ScalableTarget",
+          "Properties" : {
+            "MaxCapacity" : "6",
+            "MinCapacity" : "1",
+            "RoleARN" : { "Fn::Sub" : "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService" },
+            "ServiceNamespace" : "ecs",
+            "ScalableDimension" : "ecs:service:DesiredCount",
+            "ResourceId" : { "Fn::Join": [ "/", [ "service" ,{ "Ref": "ApplicationECSCluster" }, {"Fn::GetAtt" : ["ApplicationECSService", "Name"] } ] ] }
+          }
+        }
+
+    }
+
+}
