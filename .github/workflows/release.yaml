@@ -1,0 +1,15 @@
+name: Manual Version Print
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number'
+        required: true
+        type: string
+
+jobs:
+  print-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print Version
+        run: echo "The provided version is ${{ github.event.inputs.workflow_dispatch.version }}"
